@@ -1,0 +1,19 @@
+#pragma once
+
+#include "driver/gpio.h"
+
+#define PET_I2S_SD_GPIO       GPIO_NUM_16
+#define PET_I2S_BCLK_GPIO     GPIO_NUM_17
+#define PET_I2S_WS_GPIO       GPIO_NUM_18
+
+#define PET_I2C_SDA_GPIO      GPIO_NUM_8
+#define PET_I2C_SCL_GPIO      GPIO_NUM_9
+#define PET_MPR121_IRQ_GPIO   GPIO_NUM_10
+
+#define PET_LED_A_GPIO        GPIO_NUM_4
+#define PET_LED_B_GPIO        GPIO_NUM_5
+
+#define PET_AUDIO_SAMPLE_RATE 16000
+#define PET_AUDIO_FRAME_MS    40
+#define PET_AUDIO_SAMPLES     (PET_AUDIO_SAMPLE_RATE * PET_AUDIO_FRAME_MS / 1000)
+#define PET_AUDIO_BYTES       (PET_AUDIO_SAMPLES * sizeof(int16_t))

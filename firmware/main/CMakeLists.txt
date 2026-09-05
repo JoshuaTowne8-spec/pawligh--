@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "pet_wifi.c"
+        "pet_audio.c"
+        "pet_cloud.c"
+        "pet_touch.c"
+        "pet_leds.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_driver_i2s
+        esp_driver_i2c
+        esp_driver_gpio
+        json
+        mbedtls
+        esp-tls
+        esp_websocket_client
+        led_strip
+)
