@@ -13,7 +13,9 @@
 
 static const char *TAG = "pet_main";
 static StaticStreamBuffer_t s_audio_stream_state;
-static uint8_t s_audio_stream_storage[PET_AUDIO_BYTES * 12 + 1];
+// Static FreeRTOS stream buffers reserve one byte internally. The extra byte
+// below leaves exactly 24 complete 1280-byte PCM frames available to callers.
+static uint8_t s_audio_stream_storage[PET_AUDIO_BYTES * PET_AUDIO_QUEUE_FRAMES + 1];
 
 void app_main(void)
 {
@@ -34,7 +36,7 @@ void app_main(void)
     }
 
     StreamBufferHandle_t audio_stream = xStreamBufferCreateStatic(
-        PET_AUDIO_BYTES * 12,
+        sizeof(s_audio_stream_storage),
         PET_AUDIO_BYTES,
         s_audio_stream_storage,
         &s_audio_stream_state

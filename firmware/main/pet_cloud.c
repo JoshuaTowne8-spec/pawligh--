@@ -18,6 +18,7 @@ static StreamBufferHandle_t s_audio_stream;
 static volatile bool s_connected;
 static volatile bool s_flush_audio;
 static char s_text_message[1024];
+static uint8_t s_audio_batch[PET_AUDIO_BATCH_BYTES];
 
 static void process_json(const char *text, size_t length)
 {
@@ -90,8 +91,6 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
 
 static void upload_task(void *arg)
 {
-    uint8_t frame[PET_AUDIO_BYTES];
-
     while (true) {
         if (s_flush_audio) {
             size_t discarded = 0;
@@ -99,8 +98,8 @@ static void upload_task(void *arg)
             do {
                 received = xStreamBufferReceive(
                     s_audio_stream,
-                    frame,
-                    sizeof(frame),
+                    s_audio_batch,
+                    sizeof(s_audio_batch),
                     0
                 );
                 discarded += received;
@@ -116,24 +115,38 @@ static void upload_task(void *arg)
             continue;
         }
 
-        size_t received = xStreamBufferReceive(
-            s_audio_stream,
-            frame,
-            sizeof(frame),
-            pdMS_TO_TICKS(1000)
-        );
-        if (received == 0 || !s_connected || !esp_websocket_client_is_connected(s_client)) {
+        size_t batch_bytes = 0;
+        for (int frame_index = 0; frame_index < PET_AUDIO_BATCH_FRAMES; ++frame_index) {
+            size_t received = xStreamBufferReceive(
+                s_audio_stream,
+                s_audio_batch + batch_bytes,
+                PET_AUDIO_BYTES,
+                pdMS_TO_TICKS(250)
+            );
+            if (received != PET_AUDIO_BYTES) {
+                if (received > 0) {
+                    ESP_LOGW(TAG, "Discarded incomplete audio frame: %u bytes", (unsigned)received);
+                }
+                batch_bytes = 0;
+                break;
+            }
+            batch_bytes += received;
+        }
+
+        if (batch_bytes != PET_AUDIO_BATCH_BYTES ||
+            !s_connected || !esp_websocket_client_is_connected(s_client)) {
             continue;
         }
 
         int sent = esp_websocket_client_send_bin(
             s_client,
-            (const char *)frame,
-            received,
-            pdMS_TO_TICKS(1000)
+            (const char *)s_audio_batch,
+            batch_bytes,
+            pdMS_TO_TICKS(5000)
         );
-        if (sent < 0) {
-            ESP_LOGW(TAG, "Audio upload failed");
+        if (sent != (int)batch_bytes) {
+            ESP_LOGW(TAG, "Audio upload incomplete: sent=%d expected=%u", sent, (unsigned)batch_bytes);
+            s_flush_audio = true;
         }
     }
 }
@@ -164,8 +177,14 @@ esp_err_t pet_cloud_start(StreamBufferHandle_t audio_stream)
         .uri = CONFIG_PET_GATEWAY_URI,
         .headers = authorization,
         .buffer_size = 8192,
-        .network_timeout_ms = 10000,
+        .network_timeout_ms = 30000,
         .reconnect_timeout_ms = 3000,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 5,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
+        .ping_interval_sec = 15,
+        .pingpong_timeout_sec = 10,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_client = esp_websocket_client_init(&config);

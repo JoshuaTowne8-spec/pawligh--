@@ -67,8 +67,9 @@ esp_err_t pet_wifi_connect(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &config), TAG, "set config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "disable Wi-Fi power save failed");
 
-    ESP_LOGI(TAG, "Waiting for Wi-Fi connection to %s", CONFIG_PET_WIFI_SSID);
+    ESP_LOGI(TAG, "Waiting for Wi-Fi connection to %s (power save disabled)", CONFIG_PET_WIFI_SSID);
     xEventGroupWaitBits(
         s_wifi_events,
         WIFI_CONNECTED_BIT,

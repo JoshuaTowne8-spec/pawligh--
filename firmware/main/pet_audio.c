@@ -6,6 +6,7 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
 #include "pet_pins.h"
 
@@ -19,6 +20,19 @@ static volatile bool s_streaming;
 // stack for i2s_channel_read() and caused memory corruption/GDMA crashes.
 static int32_t s_raw_samples[PET_AUDIO_SAMPLES];
 static int16_t s_pcm_samples[PET_AUDIO_SAMPLES];
+static uint32_t s_dropped_frames;
+static int64_t s_last_drop_log_us;
+
+static void note_dropped_frame(void)
+{
+    ++s_dropped_frames;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_drop_log_us >= 1000000) {
+        ESP_LOGW(TAG, "Audio queue busy; dropped %u complete frame(s)", (unsigned)s_dropped_frames);
+        s_dropped_frames = 0;
+        s_last_drop_log_us = now;
+    }
+}
 
 static int16_t convert_sample(int32_t raw)
 {
@@ -56,9 +70,15 @@ static void audio_task(void *arg)
 
         if (s_streaming) {
             size_t bytes = samples * sizeof(s_pcm_samples[0]);
+            // A stream buffer may accept a partial write. Check first so PCM16
+            // frames are always queued whole or dropped whole.
+            if (bytes != PET_AUDIO_BYTES || xStreamBufferSpacesAvailable(s_output_stream) < bytes) {
+                note_dropped_frame();
+                continue;
+            }
             size_t sent = xStreamBufferSend(s_output_stream, s_pcm_samples, bytes, 0);
             if (sent != bytes) {
-                ESP_LOGW(TAG, "Audio queue full; dropped %u bytes", (unsigned)(bytes - sent));
+                note_dropped_frame();
             }
         }
     }
@@ -117,6 +137,13 @@ esp_err_t pet_audio_start(StreamBufferHandle_t output_stream)
 
 void pet_audio_set_streaming(bool enabled)
 {
+    if (s_streaming == enabled) {
+        return;
+    }
     s_streaming = enabled;
+    if (!enabled) {
+        s_dropped_frames = 0;
+        s_last_drop_log_us = 0;
+    }
     ESP_LOGI(TAG, "Audio streaming %s", enabled ? "enabled" : "disabled");
 }

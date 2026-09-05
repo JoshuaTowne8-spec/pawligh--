@@ -294,7 +294,9 @@ async def device_audio(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("ESP32 connected: %s", websocket.client)
     device_locks.setdefault(websocket, asyncio.Lock())
-    audio_queue: asyncio.Queue[bytes | str] = asyncio.Queue(maxsize=25)
+    # ESP32 uploads one 160 ms batch at a time. Twelve batches retain less than
+    # two seconds of audio while still absorbing short cloud-side stalls.
+    audio_queue: asyncio.Queue[bytes | str] = asyncio.Queue(maxsize=12)
     receiver = asyncio.create_task(receive_device_messages(websocket, audio_queue))
     relay = asyncio.create_task(relay_cloud_sessions(websocket, audio_queue))
 

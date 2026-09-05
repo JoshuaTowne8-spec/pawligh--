@@ -9,7 +9,7 @@ the transcript and one of five fixed emotion IDs.
 
 - URL: `wss://YOUR_DOMAIN/v1/device/audio`
 - Header: `Authorization: Bearer DEVICE_TOKEN`
-- Payload: binary PCM, preferably 40 ms (1280 bytes) per frame
+- Payload: binary PCM; current ESP32 firmware sends 160 ms (5120 bytes) per message
 - Control: send `{"type":"finish"}` before closing a session
 
 Example result:
