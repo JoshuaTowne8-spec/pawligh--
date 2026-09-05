@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <stdlib.h>
 #include <ArduinoJson.h>
 #include <ESP_I2S.h>
 #include <FastLED.h>
@@ -126,17 +125,6 @@ static bool timeBefore(uint32_t now, uint32_t deadline) {
   return static_cast<int32_t>(deadline - now) > 0;
 }
 
-static EffectType parseEffectType(const char *name) {
-  if (!name) return EffectType::Breath;
-  if (!strcmp(name, "solid")) return EffectType::Solid;
-  if (!strcmp(name, "wave")) return EffectType::Wave;
-  if (!strcmp(name, "center_breath")) return EffectType::CenterBreath;
-  if (!strcmp(name, "chase")) return EffectType::Chase;
-  if (!strcmp(name, "sparkle")) return EffectType::Sparkle;
-  if (!strcmp(name, "heartbeat")) return EffectType::Heartbeat;
-  return EffectType::Breath;
-}
-
 static CRGB blendColors(const CRGB &a, const CRGB &b, uint8_t amount) {
   return CRGB(lerp8by8(a.r, b.r, amount), lerp8by8(a.g, b.g, amount), lerp8by8(a.b, b.b, amount));
 }
@@ -145,6 +133,7 @@ static CRGB effectPixel(
   const EffectConfig &fx,
   bool overlay,
   bool fastOverlay,
+  uint8_t row,
   uint16_t index,
   uint16_t count,
   uint8_t phase
@@ -154,11 +143,17 @@ static CRGB effectPixel(
   uint16_t temporal = (millis() * static_cast<uint32_t>(fx.speed)) / (fx.periodMs ? fx.periodMs : 1000);
   uint8_t wave = triangle8(phase + position + temporal * 8);
   uint8_t amount = 128;
+  CRGB color1 = fx.color1;
+  CRGB color2 = fx.color2;
 
   if (overlay && fastOverlay) {
     amount = triangle8(phase + position * 2);
+    color1 = CRGB(255, 209, 102);
+    color2 = CRGB(255, 100, 30);
   } else if (overlay) {
     amount = 80 + triangle8(phase / 2) / 3;
+    color1 = CRGB(233, 162, 143);
+    color2 = CRGB(255, 224, 194);
   } else if (fx.type == EffectType::Solid) {
     amount = 255;
   } else if (fx.type == EffectType::Wave) {
@@ -173,7 +168,7 @@ static CRGB effectPixel(
     amount = 40 + wave * 215 / 255;
   }
   if (!overlay && fx.type == EffectType::Sparkle && random8(100) < fx.sparkle) amount = 255;
-  CRGB result = blendColors(fx.color1, fx.color2, amount);
+  CRGB result = blendColors(color1, color2, amount);
   result.nscale8_video(static_cast<uint16_t>(fx.brightness) * PET_LED_BRIGHTNESS / 128);
   return result;
 }
@@ -200,42 +195,28 @@ static void updateLEDs() {
   }
   for (uint16_t i = 0; i < PET_LED_COUNT_A; ++i) {
     ledsA[i] = effectPixel(activeEffect, touchOverlayActive,
-                            touchOverlayFast, i, PET_LED_COUNT_A, animationPhase);
+                            touchOverlayFast, 0, i, PET_LED_COUNT_A, animationPhase);
   }
   for (uint16_t i = 0; i < PET_LED_COUNT_B; ++i) {
     // Reverse B logically so both rows animate in the same visual direction.
     ledsB[PET_LED_COUNT_B - 1 - i] = effectPixel(
       activeEffect, touchOverlayActive,
-      touchOverlayFast, i, PET_LED_COUNT_B, animationPhase
+      touchOverlayFast, 1, i, PET_LED_COUNT_B, animationPhase
     );
   }
   FastLED.show();
   animationPhase += touchOverlayActive && touchOverlayFast ? 10 : 3;
 }
 
-static uint32_t hexColor(const char *text) {
-  if (!text || text[0] != '#') return 0;
-  return strtoul(text + 1, nullptr, 16);
-}
-
 static void setBuiltinPreset(const char *name) {
-  if (!strcmp(name, "happy")) activeEffect={EffectType::Sparkle,CRGB(255,179,71),CRGB(255,224,138),96,75,900,18,true};
+  if (!strcmp(name, "warm")) activeEffect={EffectType::Breath,CRGB(242,160,123),CRGB(255,215,181),72,30,2600,0,true};
+  else if (!strcmp(name, "happy")) activeEffect={EffectType::Sparkle,CRGB(255,179,71),CRGB(255,224,138),96,75,900,18,true};
   else if (!strcmp(name, "miss")) activeEffect={EffectType::CenterBreath,CRGB(233,149,121),CRGB(255,208,181),78,28,3000,2,true};
   else if (!strcmp(name, "sad")) activeEffect={EffectType::Wave,CRGB(37,74,135),CRGB(122,159,209),42,16,3600,0,true};
   else activeEffect={EffectType::Breath,CRGB(255,228,181),CRGB(217,242,230),52,18,4200,0,true};
 }
 
 static void setEmotion(const char *name) { setBuiltinPreset(name ? name : "calm"); Serial.printf("[led] preset: %s\n", name ? name : "calm"); }
-
-static void applyEffectConfig(JsonObjectConst config) {
-  EffectConfig next = activeEffect;
-  next.type = parseEffectType(config["type"] | "breath");
-  uint32_t c1=hexColor(config["color1"] | "#ffffff"), c2=hexColor(config["color2"] | "#ffffff");
-  next.color1=CRGB(c1>>16,c1>>8,c1); next.color2=CRGB(c2>>16,c2>>8,c2);
-  next.brightness=constrain(config["brightness"] | 64,1,128); next.speed=constrain(config["speed"] | 20,1,100);
-  next.periodMs=constrain(config["period_ms"] | 2000,200,20000); next.sparkle=constrain(config["sparkle"] | 0,0,100); next.mirror=config["mirror"] | true;
-  activeEffect=next;
-}
 
 static void triggerTouchEffect(bool fast) {
   touchOverlayFast = fast;
@@ -317,12 +298,6 @@ static void handleGatewayMessage(uint8_t *payload, size_t length) {
     gatewayReady = true;
     streamAudioToCloud = true;
     Serial.println("[cloud] gateway ready; audio upload enabled");
-  } else if (!strcmp(type, "effect.select")) {
-    const char *preset = document["preset"] | "calm";
-    setEmotion(preset);
-    if (!document["config"].isNull()) {
-      applyEffectConfig(document["config"].as<JsonObjectConst>());
-    }
   } else if (!strcmp(type, "emotion")) {
     setEmotion(document["emotion"] | "calm");
   } else if (strstr(type, "error") != nullptr) {

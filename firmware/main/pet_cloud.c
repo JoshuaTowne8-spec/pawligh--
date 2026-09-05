@@ -17,6 +17,7 @@ static const char *TAG = "pet_cloud";
 static esp_websocket_client_handle_t s_client;
 static StreamBufferHandle_t s_audio_stream;
 static volatile bool s_connected;
+static volatile bool s_flush_audio;
 static char *s_text_message;
 static size_t s_text_capacity;
 
@@ -33,12 +34,9 @@ static void process_json(const char *text, size_t length)
         if (strcmp(type->valuestring, "ready") == 0) {
             ESP_LOGI(TAG, "Gateway ready; microphone upload enabled");
             pet_audio_set_streaming(true);
-        } else if (strcmp(type->valuestring, "effect.select") == 0) {
-            const cJSON *preset = cJSON_GetObjectItemCaseSensitive(root, "preset");
-            const cJSON *config = cJSON_GetObjectItemCaseSensitive(root, "config");
-            if (cJSON_IsString(preset)) {
-                pet_leds_apply_config(preset->valuestring, config);
-            }
+        } else if (strcmp(type->valuestring, "audio.pause") == 0) {
+            ESP_LOGW(TAG, "Gateway cloud session paused; microphone upload disabled");
+            pet_audio_set_streaming(false);
         } else if (strcmp(type->valuestring, "emotion") == 0) {
             const cJSON *emotion = cJSON_GetObjectItemCaseSensitive(root, "emotion");
             if (cJSON_IsString(emotion)) {
@@ -63,6 +61,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_connected = false;
+        s_flush_audio = true;
         pet_audio_set_streaming(false);
         ESP_LOGW(TAG, "Gateway disconnected; client will reconnect");
         break;
@@ -92,6 +91,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
+        s_flush_audio = true;
         ESP_LOGE(TAG, "WebSocket transport error");
         break;
     default:
@@ -104,6 +104,29 @@ static void upload_task(void *arg)
     uint8_t frame[PET_AUDIO_BYTES];
 
     while (true) {
+        if (s_flush_audio) {
+            size_t discarded = 0;
+            size_t received = 0;
+            do {
+                received = xStreamBufferReceive(
+                    s_audio_stream,
+                    frame,
+                    sizeof(frame),
+                    0
+                );
+                discarded += received;
+            } while (received > 0);
+            s_flush_audio = false;
+            if (discarded > 0) {
+                ESP_LOGI(TAG, "Discarded %u bytes of stale audio", (unsigned)discarded);
+            }
+        }
+
+        if (!s_connected || !esp_websocket_client_is_connected(s_client)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         size_t received = xStreamBufferReceive(
             s_audio_stream,
             frame,
@@ -151,7 +174,7 @@ esp_err_t pet_cloud_start(StreamBufferHandle_t audio_stream)
     esp_websocket_client_config_t config = {
         .uri = CONFIG_PET_GATEWAY_URI,
         .headers = authorization,
-        .buffer_size = 2048,
+        .buffer_size = 8192,
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = 3000,
         .crt_bundle_attach = esp_crt_bundle_attach,

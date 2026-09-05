@@ -34,7 +34,7 @@ void app_main(void)
 
     err = pet_touch_start();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Touch disabled: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "MPR121 touch initialization failed: %s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(pet_wifi_connect());

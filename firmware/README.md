@@ -85,12 +85,12 @@ idf.py -p COM5 flash monitor
 4. 串口依次出现 `Got IP`、`Connected to emotion gateway`、`Gateway ready`。
 5. 正常讲话结束约 0.5 秒后，网关将百炼结果归一化为五类产品情绪，基础灯效随之变化。
 
-支持的产品情绪为 `warm`（温暖）、`happy`（快乐）、`calm`（平静）、`miss`（想念）、`sad`（难过）。快速连续滑过至少三个触摸区会触发 1.5 秒金色追逐；持续触摸约 0.8 秒会触发 3 秒玫瑰金呼吸。灯效参数可在 `http://192.168.18.49:8080/control` 修改，保存后会即时发送到 ESP32。
+支持的产品情绪为 `warm`（温暖）、`happy`（快乐）、`calm`（平静）、`miss`（想念）、`sad`（难过）。五个语音灯效已经固化在设备中；快速连续滑过至少三个触摸区会触发 1.5 秒金色追逐，持续触摸约 0.8 秒会触发 3 秒玫瑰金呼吸。
 
 ## 主要源码
 
 - `main/pet_audio.c`：INMP441 I2S 采集与 PCM16 转换
 - `main/pet_cloud.c`：WebSocket 鉴权、音频上传和情绪接收
 - `main/pet_touch.c`：MPR121 初始化与快/慢触摸识别
-- `main/pet_leds.c`：五类产品情绪、七种可配置灯效和两种触摸覆盖灯效
+- `main/pet_leds.c`：五类语音情绪预设和两种触摸覆盖灯效
 - `main/main.c`：系统启动顺序

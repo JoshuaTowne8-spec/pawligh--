@@ -1,31 +1,18 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import uuid
 from contextlib import suppress
-from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import FileResponse
-
-from .effects import (
-    EMOTION_LABELS,
-    PRESET_ORDER,
-    load_effects,
-    save_effects,
-    validate_effect,
-)
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
 
-app = FastAPI(title="Pet Emotion Gateway", version="0.2.0")
-APP_DIR = Path(__file__).resolve().parent
-EFFECTS_PATH = APP_DIR.parent / "data" / "effects.json"
-effects = load_effects(EFFECTS_PATH)
-connected_devices: set[WebSocket] = set()
+app = FastAPI(title="Pet Emotion Gateway", version="0.3.0")
+logger = logging.getLogger("pet_gateway")
 device_locks: dict[WebSocket, asyncio.Lock] = {}
-active_preset = "calm"
 
 def normalize_emotion(raw: str, transcript: str) -> str:
     """Map ASR's seven acoustic labels plus speech content to five product labels."""
@@ -49,24 +36,6 @@ async def send_to_device(device: WebSocket, payload: dict) -> None:
     lock = device_locks.setdefault(device, asyncio.Lock())
     async with lock:
         await device.send_json(payload)
-
-
-async def broadcast(payload: dict) -> None:
-    stale = []
-    for device in tuple(connected_devices):
-        try:
-            await send_to_device(device, payload)
-        except Exception:
-            stale.append(device)
-    for device in stale:
-        connected_devices.discard(device)
-        device_locks.pop(device, None)
-
-
-async def select_preset(preset: str) -> None:
-    global active_preset
-    active_preset = preset
-    await broadcast({"type": "effect.select", "preset": preset, "config": effects[preset]})
 
 
 def required_env(name: str) -> str:
@@ -147,63 +116,20 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/control")
-async def control_page():
-    return FileResponse(APP_DIR / "static" / "control.html")
-
-
-@app.get("/api/effects")
-async def get_effects() -> dict:
-    return {"order": PRESET_ORDER, "labels": EMOTION_LABELS, "effects": effects, "active": active_preset}
-
-
-@app.get("/api/status")
-async def get_status() -> dict:
-    return {"devices": len(connected_devices), "active": active_preset}
-
-
-@app.put("/api/effects/{preset}")
-async def update_effect(preset: str, payload: dict) -> dict:
-    try:
-        effects[preset] = validate_effect(payload, preset)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    save_effects(EFFECTS_PATH, effects)
-    if active_preset == preset:
-        await select_preset(preset)
-    return effects[preset]
-
-
-@app.post("/api/effects/{preset}/activate")
-async def activate_effect(preset: str) -> dict[str, str]:
-    if preset not in PRESET_ORDER:
-        raise HTTPException(status_code=404, detail="unknown preset")
-    await select_preset(preset)
-    return {"active": preset}
-
-
-@app.post("/api/effects/reset")
-async def reset_effects() -> dict:
-    global effects
-    effects = load_effects(Path("__missing_defaults_only__"))
-    save_effects(EFFECTS_PATH, effects)
-    await select_preset(active_preset)
-    return {"effects": effects}
-
-
-async def send_audio_to_cloud(device: WebSocket, cloud: websockets.WebSocketClientProtocol) -> None:
+async def receive_device_messages(
+    device: WebSocket,
+    audio_queue: asyncio.Queue[bytes | str],
+) -> None:
     while True:
         message = await device.receive()
         if message["type"] == "websocket.disconnect":
             return
         audio = message.get("bytes")
         if audio:
-            await cloud.send(
-                event(
-                    "input_audio_buffer.append",
-                    audio=base64.b64encode(audio).decode("ascii"),
-                )
-            )
+            if audio_queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    audio_queue.get_nowait()
+            audio_queue.put_nowait(audio)
             continue
 
         text = message.get("text")
@@ -211,8 +137,27 @@ async def send_audio_to_cloud(device: WebSocket, cloud: websockets.WebSocketClie
             continue
         command = json.loads(text)
         if command.get("type") == "finish":
+            if audio_queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    audio_queue.get_nowait()
+            audio_queue.put_nowait("finish")
+
+
+async def send_audio_to_cloud(
+    audio_queue: asyncio.Queue[bytes | str],
+    cloud: websockets.WebSocketClientProtocol,
+) -> None:
+    while True:
+        item = await audio_queue.get()
+        if item == "finish":
             await cloud.send(event("session.finish"))
             return
+        await cloud.send(
+            event(
+                "input_audio_buffer.append",
+                audio=base64.b64encode(item).decode("ascii"),
+            )
+        )
 
 
 async def send_results_to_device(device: WebSocket, cloud: websockets.WebSocketClientProtocol) -> None:
@@ -221,10 +166,11 @@ async def send_results_to_device(device: WebSocket, cloud: websockets.WebSocketC
         message_type = message.get("type", "")
 
         if error := cloud_error(message):
-            await device.send_json(
+            await send_to_device(
+                device,
                 {"type": "cloud_error", "message": str(error)}
             )
-            return
+            raise error
 
         if message_type == "conversation.item.input_audio_transcription.completed":
             raw_emotion = message.get("emotion") or "neutral"
@@ -233,19 +179,80 @@ async def send_results_to_device(device: WebSocket, cloud: websockets.WebSocketC
             await send_to_device(
                 device,
                 {
-                    "type": "effect.select",
+                    "type": "emotion",
                     "emotion": emotion,
-                    "preset": emotion,
-                    "config": effects[emotion],
                     "raw_emotion": raw_emotion,
                     "transcript": transcript,
                     "hold_ms": 12000,
                 }
             )
-            global active_preset
-            active_preset = emotion
         elif message_type == "session.finished":
             return
+
+
+def discard_queued_audio(audio_queue: asyncio.Queue[bytes | str]) -> int:
+    discarded = 0
+    while True:
+        try:
+            item = audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return discarded
+        if isinstance(item, bytes):
+            discarded += len(item)
+
+
+async def relay_cloud_sessions(
+    device: WebSocket,
+    audio_queue: asyncio.Queue[bytes | str],
+) -> None:
+    api_key = required_env("DASHSCOPE_API_KEY")
+    retry_seconds = 1
+
+    while True:
+        try:
+            async with websockets.connect(
+                dashscope_url(),
+                extra_headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "OpenAI-Beta": "realtime=v1",
+                },
+                open_timeout=15,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=4 * 1024 * 1024,
+            ) as cloud:
+                await configure_cloud(cloud)
+                discarded = discard_queued_audio(audio_queue)
+                if discarded:
+                    logger.info("Discarded %d bytes before cloud reconnect", discarded)
+
+                await send_to_device(device, {"type": "ready", "sample_rate": 16000})
+                retry_seconds = 1
+
+                uplink = asyncio.create_task(send_audio_to_cloud(audio_queue, cloud))
+                downlink = asyncio.create_task(send_results_to_device(device, cloud))
+                done, pending = await asyncio.wait(
+                    {uplink, downlink}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+                for task in done:
+                    task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Cloud session failed; reconnecting in %s second(s)", retry_seconds)
+            discard_queued_audio(audio_queue)
+            with suppress(Exception):
+                await send_to_device(
+                    device,
+                    {"type": "audio.pause", "message": str(exc)},
+                )
+            await asyncio.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, 10)
 
 
 @app.websocket("/v1/device/audio")
@@ -256,46 +263,30 @@ async def device_audio(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    connected_devices.add(websocket)
     device_locks.setdefault(websocket, asyncio.Lock())
-    api_key = required_env("DASHSCOPE_API_KEY")
+    audio_queue: asyncio.Queue[bytes | str] = asyncio.Queue(maxsize=25)
+    receiver = asyncio.create_task(receive_device_messages(websocket, audio_queue))
+    relay = asyncio.create_task(relay_cloud_sessions(websocket, audio_queue))
 
     try:
-        async with websockets.connect(
-            dashscope_url(),
-            extra_headers={"Authorization": f"Bearer {api_key}"},
-            open_timeout=15,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=4 * 1024 * 1024,
-        ) as cloud:
-            await configure_cloud(cloud)
-            await send_to_device(websocket, {"type": "ready", "sample_rate": 16000})
-            await send_to_device(websocket, {"type": "effects.sync", "presets": effects})
-            await send_to_device(websocket, {"type": "effect.select", "preset": active_preset, "config": effects[active_preset]})
-
-            uplink = asyncio.create_task(send_audio_to_cloud(websocket, cloud))
-            downlink = asyncio.create_task(send_results_to_device(websocket, cloud))
-            done, pending = await asyncio.wait(
-                {uplink, downlink}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-            for task in pending:
-                with suppress(asyncio.CancelledError):
-                    await task
-            for task in done:
-                task.result()
+        done, _ = await asyncio.wait(
+            {receiver, relay}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            task.result()
     except WebSocketDisconnect:
         return
     except Exception as exc:
+        logger.exception("Device relay failed")
         with suppress(Exception):
             await send_to_device(
                 websocket,
-                {"type": "gateway_error", "message": type(exc).__name__}
+                {"type": "gateway_error", "message": str(exc)}
             )
-        with suppress(Exception):
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
     finally:
-        connected_devices.discard(websocket)
+        receiver.cancel()
+        relay.cancel()
+        for task in (receiver, relay):
+            with suppress(asyncio.CancelledError, Exception):
+                await task
         device_locks.pop(websocket, None)
