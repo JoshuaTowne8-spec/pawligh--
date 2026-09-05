@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -66,45 +65,45 @@ static esp_err_t configure_mpr121(void)
 
 static void touch_task(void *arg)
 {
-    uint16_t previous = 0;
+    bool touching = false;
     int64_t gesture_start_us = 0;
-    unsigned transitions = 0;
     bool slow_fired = false;
+    unsigned read_errors = 0;
 
     while (true) {
         uint16_t mask = 0;
         if (read_touch_mask(&mask) != ESP_OK) {
-            ESP_LOGW(TAG, "MPR121 read failed");
+            if (++read_errors % 20 == 1) {
+                ESP_LOGW(TAG, "MPR121 read failed; check SDA/SCL and 3.3 V power");
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        read_errors = 0;
         int64_t now = esp_timer_get_time();
+        bool touched_now = mask != 0;
 
-        if (previous == 0 && mask != 0) {
+        if (!touching && touched_now) {
+            touching = true;
             gesture_start_us = now;
-            transitions = 1;
             slow_fired = false;
-        } else if (mask != previous && mask != 0) {
-            ++transitions;
         }
 
-        if (mask != 0 && !slow_fired && now - gesture_start_us >= 800000) {
+        if (touching && touched_now && !slow_fired && now - gesture_start_us >= 800000) {
             pet_leds_trigger_touch(false);
             slow_fired = true;
         }
 
-        if (previous != 0 && mask == 0) {
+        if (touching && !touched_now) {
             int64_t duration = now - gesture_start_us;
-            if (!slow_fired && transitions >= 3 && duration <= 1200000) {
+            if (!slow_fired && duration >= 50000) {
                 pet_leds_trigger_touch(true);
-            } else if (!slow_fired && duration >= 500000) {
-                pet_leds_trigger_touch(false);
             }
+            touching = false;
             gesture_start_us = 0;
         }
 
-        previous = mask;
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -123,7 +122,8 @@ esp_err_t pet_touch_start(void)
     i2c_device_config_t device_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = MPR121_ADDRESS,
-        .scl_speed_hz = 400000,
+        // 100 kHz is more tolerant of the longer wires used for the copper pads.
+        .scl_speed_hz = 100000,
     };
     ESP_RETURN_ON_ERROR(
         i2c_master_bus_add_device(s_bus, &device_config, &s_mpr121),
@@ -131,14 +131,6 @@ esp_err_t pet_touch_start(void)
         "MPR121 device failed"
     );
 
-    gpio_config_t irq_config = {
-        .pin_bit_mask = 1ULL << PET_MPR121_IRQ_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&irq_config), TAG, "IRQ GPIO failed");
     ESP_RETURN_ON_ERROR(configure_mpr121(), TAG, "MPR121 configuration failed");
 
     uint16_t initial;
@@ -146,6 +138,6 @@ esp_err_t pet_touch_start(void)
     if (xTaskCreate(touch_task, "pet_touch", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "MPR121 started: E0=head, E1-E7=back");
+    ESP_LOGI(TAG, "MPR121 ready: E0=head, E1-E7=back; short tap=quick, hold=slow");
     return ESP_OK;
 }

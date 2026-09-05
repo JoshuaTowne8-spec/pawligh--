@@ -1,7 +1,6 @@
 #include "pet_cloud.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -18,8 +17,7 @@ static esp_websocket_client_handle_t s_client;
 static StreamBufferHandle_t s_audio_stream;
 static volatile bool s_connected;
 static volatile bool s_flush_audio;
-static char *s_text_message;
-static size_t s_text_capacity;
+static char s_text_message[1024];
 
 static void process_json(const char *text, size_t length)
 {
@@ -69,18 +67,9 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
         if (event->op_code != 0x1 && event->op_code != 0x0) {
             break;
         }
-        if (event->payload_len <= 0 || event->payload_len > 4096) {
+        if (event->payload_len <= 0 || event->payload_len >= sizeof(s_text_message)) {
             ESP_LOGW(TAG, "Unexpected text payload length: %d", event->payload_len);
             break;
-        }
-        if ((size_t)event->payload_len + 1 > s_text_capacity) {
-            char *next = realloc(s_text_message, event->payload_len + 1);
-            if (!next) {
-                ESP_LOGE(TAG, "No memory for WebSocket message");
-                break;
-            }
-            s_text_message = next;
-            s_text_capacity = event->payload_len + 1;
         }
         if (event->payload_offset + event->data_len <= event->payload_len) {
             memcpy(s_text_message + event->payload_offset, event->data_ptr, event->data_len);

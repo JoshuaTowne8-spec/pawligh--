@@ -8,7 +8,6 @@
 
 #define PET_I2C_SDA_GPIO      GPIO_NUM_8
 #define PET_I2C_SCL_GPIO      GPIO_NUM_9
-#define PET_MPR121_IRQ_GPIO   GPIO_NUM_10
 
 #define PET_LED_A_GPIO        GPIO_NUM_4
 #define PET_LED_B_GPIO        GPIO_NUM_5

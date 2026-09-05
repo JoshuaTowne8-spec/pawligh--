@@ -1,8 +1,9 @@
 #include "pet_leds.h"
-#include <math.h>
-#include <stdlib.h>
+
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -13,102 +14,295 @@
 #include "led_strip_rmt.h"
 #include "pet_pins.h"
 
+typedef enum {
+    EMOTION_WARM,
+    EMOTION_HAPPY,
+    EMOTION_CALM,
+    EMOTION_MISS,
+    EMOTION_SAD,
+} emotion_t;
+
+typedef enum {
+    TOUCH_NONE,
+    TOUCH_QUICK,
+    TOUCH_SLOW,
+} touch_effect_t;
+
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} rgb_t;
+
+typedef struct {
+    rgb_t color_a;
+    rgb_t color_b;
+    uint8_t brightness;
+    uint16_t period_ms;
+} emotion_preset_t;
+
 static const char *TAG = "pet_leds";
-typedef enum { FX_SOLID, FX_BREATH, FX_WAVE, FX_CENTER_BREATH, FX_CHASE, FX_SPARKLE, FX_HEARTBEAT } effect_type_t;
-typedef struct { effect_type_t type; uint8_t r1,g1,b1,r2,g2,b2,brightness,speed,sparkle; uint16_t period_ms; bool mirror; } effect_config_t;
+
+// Fixed presets avoid runtime configuration and gateway/device mismatches.
+static const emotion_preset_t PRESETS[] = {
+    [EMOTION_WARM]  = {{242, 160, 123}, {255, 215, 181}, 72, 2600},
+    [EMOTION_HAPPY] = {{255, 179,  71}, {255, 224, 138}, 96,  900},
+    [EMOTION_CALM]  = {{255, 228, 181}, {217, 242, 230}, 52, 4200},
+    [EMOTION_MISS]  = {{233, 149, 121}, {255, 208, 181}, 78, 3000},
+    [EMOTION_SAD]   = {{ 37,  74, 135}, {122, 159, 209}, 42, 3600},
+};
+
 static led_strip_handle_t s_strip_a;
 #if !CONFIG_PET_LED_CHAINED
 static led_strip_handle_t s_strip_b;
 #endif
-static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static effect_config_t s_effect;
-static int64_t s_overlay_until_us;
-static bool s_overlay_fast;
 
-static uint8_t scale8(uint8_t value, uint16_t scale) { return (uint16_t)value * scale / 255; }
-static uint8_t blend8(uint8_t a, uint8_t b, uint8_t amount) { return a + ((int)b - a) * amount / 255; }
-static uint8_t triangle(uint16_t phase) { uint8_t p = phase & 255; return p < 128 ? p * 2 : (255 - p) * 2; }
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static emotion_t s_emotion = EMOTION_CALM;
+static touch_effect_t s_touch_effect = TOUCH_NONE;
+static int64_t s_touch_started_ms;
+static int64_t s_touch_until_ms;
 
-static effect_config_t default_effect(void)
+static uint8_t triangle8(uint16_t phase)
 {
-    return (effect_config_t){FX_BREATH,242,160,123,255,215,181,64,30,0,2600,true};
+    uint8_t value = phase & 0xff;
+    return value < 128 ? value * 2 : (255 - value) * 2;
 }
 
-static void set_builtin(const char *preset)
+static uint8_t mix8(uint8_t a, uint8_t b, uint8_t amount)
 {
-    effect_config_t next=default_effect();
-    if (!strcmp(preset,"happy")) next=(effect_config_t){FX_SPARKLE,255,179,71,255,224,138,96,75,18,900,true};
-    else if (!strcmp(preset,"calm")) next=(effect_config_t){FX_BREATH,255,228,181,217,242,230,52,18,0,4200,true};
-    else if (!strcmp(preset,"miss")) next=(effect_config_t){FX_CENTER_BREATH,233,149,121,255,208,181,78,28,2,3000,true};
-    else if (!strcmp(preset,"sad")) next=(effect_config_t){FX_WAVE,37,74,135,122,159,209,42,16,0,3600,true};
-    else if (!strcmp(preset,"quick_touch")) next=(effect_config_t){FX_CHASE,255,209,102,255,140,66,120,100,4,1500,true};
-    else if (!strcmp(preset,"slow_touch")) next=(effect_config_t){FX_BREATH,233,162,143,255,224,194,86,25,0,3000,true};
-    portENTER_CRITICAL(&s_lock); s_effect=next; portEXIT_CRITICAL(&s_lock);
+    return a + ((int16_t)b - a) * amount / 255;
 }
 
-void pet_leds_set_emotion(const char *emotion) { set_builtin(emotion ? emotion : "calm"); ESP_LOGI(TAG,"Base preset: %s",emotion ? emotion : "calm"); }
-
-void pet_leds_trigger_touch(bool fast) { portENTER_CRITICAL(&s_lock); s_overlay_fast=fast; s_overlay_until_us=esp_timer_get_time()+(fast?1500000:3000000); portEXIT_CRITICAL(&s_lock); }
-
-static void set_pixel(int row,int index,uint8_t r,uint8_t g,uint8_t b)
+static rgb_t mix_color(rgb_t a, rgb_t b, uint8_t amount)
 {
-    if(row==0){led_strip_set_pixel(s_strip_a,index,r,g,b);return;}
+    return (rgb_t){
+        .r = mix8(a.r, b.r, amount),
+        .g = mix8(a.g, b.g, amount),
+        .b = mix8(a.b, b.b, amount),
+    };
+}
+
+static uint8_t apply_brightness(uint8_t value, uint8_t preset_brightness)
+{
+    uint16_t level = (uint16_t)preset_brightness * CONFIG_PET_LED_BRIGHTNESS / 128;
+    return (uint16_t)value * level / 255;
+}
+
+static void write_pixel(int row, int index, rgb_t color, uint8_t brightness)
+{
+    uint8_t r = apply_brightness(color.r, brightness);
+    uint8_t g = apply_brightness(color.g, brightness);
+    uint8_t b = apply_brightness(color.b, brightness);
+
+    if (row == 0) {
+        led_strip_set_pixel(s_strip_a, index, r, g, b);
+        return;
+    }
+
+    // The second strip is installed in the opposite physical direction.
 #if CONFIG_PET_LED_CHAINED
-    led_strip_set_pixel(s_strip_a,CONFIG_PET_LED_COUNT_A+CONFIG_PET_LED_COUNT_B-1-index,r,g,b);
+    int physical_index = CONFIG_PET_LED_COUNT_A + CONFIG_PET_LED_COUNT_B - 1 - index;
+    led_strip_set_pixel(s_strip_a, physical_index, r, g, b);
 #else
-    led_strip_set_pixel(s_strip_b,CONFIG_PET_LED_COUNT_B-1-index,r,g,b);
+    int physical_index = CONFIG_PET_LED_COUNT_B - 1 - index;
+    led_strip_set_pixel(s_strip_b, physical_index, r, g, b);
 #endif
 }
 
-static void render_pixel(effect_config_t *fx,bool overlay,bool fast,int row,int index,int count,uint8_t phase)
+static uint8_t position8(int index, int count)
 {
-    uint16_t period=fx->period_ms?fx->period_ms:1000; uint16_t now=(uint32_t)(esp_timer_get_time()/1000)*fx->speed/period;
-    uint16_t pos=(uint32_t)index*255/(count>1?count-1:1); if(row==1&&fx->mirror)pos=255-pos; uint8_t wave=triangle(now*8+pos+phase),amount;
-    if(overlay&&fast){amount=triangle(phase+pos*2);fx->r1=255;fx->g1=209;fx->b1=102;fx->r2=255;fx->g2=100;fx->b2=30;}
-    else if(overlay){amount=80+triangle(phase/2)/3;fx->r1=233;fx->g1=162;fx->b1=143;fx->r2=255;fx->g2=224;fx->b2=194;}
-    else if(fx->type==FX_SOLID)amount=255; else if(fx->type==FX_WAVE)amount=wave;
-    else if(fx->type==FX_CENTER_BREATH)amount=(255-(uint8_t)abs(127-(int)pos)*2)*(80+wave/2)/255;
-    else if(fx->type==FX_CHASE){int chase=255-abs((int)((now*3+pos)&255)-128)*2;amount=(uint8_t)(chase<0?0:chase);}
-    else if(fx->type==FX_HEARTBEAT)amount=triangle(now*16); else amount=40+wave*215/255;
-    if(!overlay&&fx->type==FX_SPARKLE&&(esp_random()%100)<fx->sparkle)amount=255;
-    uint16_t brightness=(uint16_t)fx->brightness*CONFIG_PET_LED_BRIGHTNESS/128;
-    set_pixel(row,index,scale8(blend8(fx->r1,fx->r2,amount),brightness),scale8(blend8(fx->g1,fx->g2,amount),brightness),scale8(blend8(fx->b1,fx->b2,amount),brightness));
+    return count > 1 ? (uint32_t)index * 255 / (count - 1) : 0;
+}
+
+static rgb_t render_emotion(
+    emotion_t emotion,
+    const emotion_preset_t *preset,
+    uint8_t position,
+    int64_t now_ms
+)
+{
+    uint8_t time_phase = (now_ms % preset->period_ms) * 255 / preset->period_ms;
+    uint8_t amount = triangle8(time_phase);
+
+    switch (emotion) {
+    case EMOTION_HAPPY:
+        amount = 80 + triangle8(time_phase * 2) / 2;
+        if (esp_random() % 100 < 12) {
+            amount = 255;
+        }
+        break;
+    case EMOTION_MISS: {
+        int distance = abs(127 - position);
+        int centre_value = 255 - distance * 2;
+        uint8_t centre = centre_value > 0 ? centre_value : 0;
+        amount = (uint16_t)centre * (100 + triangle8(time_phase)) / 255;
+        break;
+    }
+    case EMOTION_SAD:
+        amount = triangle8(time_phase + position);
+        break;
+    case EMOTION_WARM:
+    case EMOTION_CALM:
+    default:
+        amount = 40 + triangle8(time_phase) * 215 / 255;
+        break;
+    }
+
+    return mix_color(preset->color_a, preset->color_b, amount);
+}
+
+static rgb_t render_touch(
+    touch_effect_t effect,
+    uint8_t position,
+    int64_t elapsed_ms,
+    uint8_t *brightness
+)
+{
+    if (effect == TOUCH_QUICK) {
+        uint8_t head = (elapsed_ms * 512 / 1500) & 0xff;
+        int distance = abs((int)position - head);
+        if (distance > 127) {
+            distance = 256 - distance;
+        }
+        uint8_t amount = distance < 48 ? 255 - distance * 5 : 15;
+        *brightness = 120;
+        return mix_color((rgb_t){255, 100, 30}, (rgb_t){255, 209, 102}, amount);
+    }
+
+    uint8_t pulse = 60 + triangle8((elapsed_ms * 255 / 1800) & 0xff) / 2;
+    *brightness = 86;
+    return mix_color((rgb_t){233, 162, 143}, (rgb_t){255, 224, 194}, pulse);
+}
+
+static void render_row(
+    int row,
+    int count,
+    emotion_t emotion,
+    touch_effect_t touch,
+    int64_t touch_started_ms,
+    int64_t now_ms
+)
+{
+    const emotion_preset_t *preset = &PRESETS[emotion];
+    for (int index = 0; index < count; ++index) {
+        uint8_t position = position8(index, count);
+        uint8_t brightness = preset->brightness;
+        rgb_t color;
+
+        if (touch != TOUCH_NONE) {
+            color = render_touch(touch, position, now_ms - touch_started_ms, &brightness);
+        } else {
+            color = render_emotion(emotion, preset, position, now_ms);
+        }
+        write_pixel(row, index, color, brightness);
+    }
 }
 
 static void led_task(void *arg)
 {
-    uint8_t phase=0; while(true){effect_config_t fx;bool fast;int64_t until;portENTER_CRITICAL(&s_lock);fx=s_effect;fast=s_overlay_fast;until=s_overlay_until_us;portEXIT_CRITICAL(&s_lock);bool overlay=esp_timer_get_time()<until;
-        for (int i = 0; i < CONFIG_PET_LED_COUNT_A; ++i) {
-            render_pixel(&fx, overlay, fast, 0, i, CONFIG_PET_LED_COUNT_A, phase);
+    while (true) {
+        emotion_t emotion;
+        touch_effect_t touch;
+        int64_t touch_started_ms;
+        int64_t touch_until_ms;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        portENTER_CRITICAL(&s_state_lock);
+        emotion = s_emotion;
+        touch = s_touch_effect;
+        touch_started_ms = s_touch_started_ms;
+        touch_until_ms = s_touch_until_ms;
+        if (touch != TOUCH_NONE && now_ms >= touch_until_ms) {
+            s_touch_effect = TOUCH_NONE;
+            touch = TOUCH_NONE;
         }
-        for (int i = 0; i < CONFIG_PET_LED_COUNT_B; ++i) {
-            render_pixel(&fx, overlay, fast, 1, i, CONFIG_PET_LED_COUNT_B, phase);
-        }
+        portEXIT_CRITICAL(&s_state_lock);
+
+        render_row(0, CONFIG_PET_LED_COUNT_A, emotion, touch, touch_started_ms, now_ms);
+        render_row(1, CONFIG_PET_LED_COUNT_B, emotion, touch, touch_started_ms, now_ms);
         led_strip_refresh(s_strip_a);
 #if !CONFIG_PET_LED_CHAINED
         led_strip_refresh(s_strip_b);
 #endif
-        phase+=overlay&&fast?10:3;vTaskDelay(pdMS_TO_TICKS(33));}
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
 }
 
-static esp_err_t create_strip(gpio_num_t gpio,int count,led_strip_handle_t *result)
+static esp_err_t create_strip(gpio_num_t gpio, int count, led_strip_handle_t *strip)
 {
-    led_strip_config_t config={.strip_gpio_num=gpio,.max_leds=count,.led_model=LED_MODEL_WS2812,.color_component_format=LED_STRIP_COLOR_COMPONENT_FMT_GRB,.flags.invert_out=false};
-    // Two independent strips need two RMT TX channels.  DMA mode exhausts the
-    // available TX resources on this ESP32-S3 configuration, so use normal RMT.
-    // It is fully sufficient for the 30- and 60-pixel WS2812 strips.
-    led_strip_rmt_config_t rmt={.clk_src=RMT_CLK_SRC_DEFAULT,.resolution_hz=10*1000*1000,.mem_block_symbols=64,.flags.with_dma=false};
-    return led_strip_new_rmt_device(&config,&rmt,result);
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = gpio,
+        .max_leds = count,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .mem_block_symbols = 64,
+        .flags.with_dma = false,
+    };
+    return led_strip_new_rmt_device(&strip_config, &rmt_config, strip);
 }
 
 esp_err_t pet_leds_start(void)
 {
-    set_builtin("calm");
 #if CONFIG_PET_LED_CHAINED
-    ESP_RETURN_ON_ERROR(create_strip(PET_LED_A_GPIO,CONFIG_PET_LED_COUNT_A+CONFIG_PET_LED_COUNT_B,&s_strip_a),TAG,"strip creation failed");
+    ESP_RETURN_ON_ERROR(
+        create_strip(PET_LED_A_GPIO, CONFIG_PET_LED_COUNT_A + CONFIG_PET_LED_COUNT_B, &s_strip_a),
+        TAG,
+        "LED strip creation failed"
+    );
 #else
-    ESP_RETURN_ON_ERROR(create_strip(PET_LED_A_GPIO,CONFIG_PET_LED_COUNT_A,&s_strip_a),TAG,"strip A creation failed");
-    ESP_RETURN_ON_ERROR(create_strip(PET_LED_B_GPIO,CONFIG_PET_LED_COUNT_B,&s_strip_b),TAG,"strip B creation failed");led_strip_clear(s_strip_b);
+    ESP_RETURN_ON_ERROR(
+        create_strip(PET_LED_A_GPIO, CONFIG_PET_LED_COUNT_A, &s_strip_a),
+        TAG,
+        "LED strip A creation failed"
+    );
+    ESP_RETURN_ON_ERROR(
+        create_strip(PET_LED_B_GPIO, CONFIG_PET_LED_COUNT_B, &s_strip_b),
+        TAG,
+        "LED strip B creation failed"
+    );
+    led_strip_clear(s_strip_b);
 #endif
-    led_strip_clear(s_strip_a); if(xTaskCreate(led_task,"pet_leds",4096,NULL,4,NULL)!=pdPASS)return ESP_ERR_NO_MEM; return ESP_OK;
+    led_strip_clear(s_strip_a);
+
+    if (xTaskCreate(led_task, "pet_leds", 4096, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "WS2812 ready: %d + %d pixels", CONFIG_PET_LED_COUNT_A, CONFIG_PET_LED_COUNT_B);
+    return ESP_OK;
+}
+
+void pet_leds_set_emotion(const char *emotion)
+{
+    emotion_t next = EMOTION_CALM;
+    if (emotion && strcmp(emotion, "warm") == 0) {
+        next = EMOTION_WARM;
+    } else if (emotion && strcmp(emotion, "happy") == 0) {
+        next = EMOTION_HAPPY;
+    } else if (emotion && strcmp(emotion, "miss") == 0) {
+        next = EMOTION_MISS;
+    } else if (emotion && strcmp(emotion, "sad") == 0) {
+        next = EMOTION_SAD;
+    }
+
+    portENTER_CRITICAL(&s_state_lock);
+    s_emotion = next;
+    portEXIT_CRITICAL(&s_state_lock);
+    ESP_LOGI(TAG, "Voice emotion: %s", emotion ? emotion : "calm");
+}
+
+void pet_leds_trigger_touch(bool fast)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_state_lock);
+    s_touch_effect = fast ? TOUCH_QUICK : TOUCH_SLOW;
+    s_touch_started_ms = now_ms;
+    s_touch_until_ms = now_ms + (fast ? 1500 : 3000);
+    portEXIT_CRITICAL(&s_state_lock);
+    ESP_LOGI(TAG, "Touch effect: %s", fast ? "quick" : "slow");
 }

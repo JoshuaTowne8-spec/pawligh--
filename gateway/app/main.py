@@ -79,6 +79,13 @@ def cloud_error(message: dict) -> RuntimeError | None:
     return None
 
 
+def cloud_close_detail(cloud: websockets.WebSocketClientProtocol) -> str:
+    """Return close information that is useful when a cloud session ends."""
+    code = getattr(cloud, "close_code", None)
+    reason = getattr(cloud, "close_reason", "") or "(no reason supplied)"
+    return f"code={code}, reason={reason}"
+
+
 async def configure_cloud(cloud: websockets.WebSocketClientProtocol) -> None:
     first = json.loads(await asyncio.wait_for(cloud.recv(), timeout=15))
     if error := cloud_error(first):
@@ -123,6 +130,11 @@ async def receive_device_messages(
     while True:
         message = await device.receive()
         if message["type"] == "websocket.disconnect":
+            logger.warning(
+                "ESP32 WebSocket disconnect received: code=%s, reason=%s",
+                message.get("code"),
+                message.get("reason") or "(no reason supplied)",
+            )
             return
         audio = message.get("bytes")
         if audio:
@@ -161,33 +173,37 @@ async def send_audio_to_cloud(
 
 
 async def send_results_to_device(device: WebSocket, cloud: websockets.WebSocketClientProtocol) -> None:
-    async for raw in cloud:
-        message = json.loads(raw)
-        message_type = message.get("type", "")
+    try:
+        async for raw in cloud:
+            message = json.loads(raw)
+            message_type = message.get("type", "")
 
-        if error := cloud_error(message):
-            await send_to_device(
-                device,
-                {"type": "cloud_error", "message": str(error)}
-            )
-            raise error
+            if error := cloud_error(message):
+                await send_to_device(
+                    device,
+                    {"type": "cloud_error", "message": str(error)}
+                )
+                raise error
 
-        if message_type == "conversation.item.input_audio_transcription.completed":
-            raw_emotion = message.get("emotion") or "neutral"
-            transcript = message.get("transcript", "")
-            emotion = normalize_emotion(raw_emotion, transcript)
-            await send_to_device(
-                device,
-                {
-                    "type": "emotion",
-                    "emotion": emotion,
-                    "raw_emotion": raw_emotion,
-                    "transcript": transcript,
-                    "hold_ms": 12000,
-                }
-            )
-        elif message_type == "session.finished":
-            return
+            if message_type == "conversation.item.input_audio_transcription.completed":
+                raw_emotion = message.get("emotion") or "neutral"
+                transcript = message.get("transcript", "")
+                emotion = normalize_emotion(raw_emotion, transcript)
+                await send_to_device(
+                    device,
+                    {
+                        "type": "emotion",
+                        "emotion": emotion,
+                        "raw_emotion": raw_emotion,
+                        "transcript": transcript,
+                        "hold_ms": 12000,
+                    }
+                )
+            elif message_type == "session.finished":
+                logger.info("Cloud session finished: %s", cloud_close_detail(cloud))
+                return
+    finally:
+        logger.warning("Cloud result stream ended: %s", cloud_close_detail(cloud))
 
 
 def discard_queued_audio(audio_queue: asyncio.Queue[bytes | str]) -> int:
@@ -231,16 +247,29 @@ async def relay_cloud_sessions(
 
                 uplink = asyncio.create_task(send_audio_to_cloud(audio_queue, cloud))
                 downlink = asyncio.create_task(send_results_to_device(device, cloud))
-                done, pending = await asyncio.wait(
-                    {uplink, downlink}, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with suppress(asyncio.CancelledError):
-                        await task
-                for task in done:
-                    task.result()
+                try:
+                    done, _ = await asyncio.wait(
+                        {uplink, downlink}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        task.result()
+
+                    # A normal return from the cloud receive loop means that the
+                    # remote side closed the WebSocket. Treat it as a recoverable
+                    # cloud failure and keep the ESP32 connection alive for retry.
+                    if downlink in done:
+                        raise RuntimeError(
+                            "Cloud WebSocket closed: " + cloud_close_detail(cloud)
+                        )
+                finally:
+                    # asyncio.wait does not cancel child tasks when this relay is
+                    # cancelled. Always finish both tasks before reconnecting or
+                    # closing the device socket, otherwise Python emits pending-task
+                    # warnings and the next session can inherit stale audio work.
+                    for task in (uplink, downlink):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(uplink, downlink, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -263,6 +292,7 @@ async def device_audio(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    logger.info("ESP32 connected: %s", websocket.client)
     device_locks.setdefault(websocket, asyncio.Lock())
     audio_queue: asyncio.Queue[bytes | str] = asyncio.Queue(maxsize=25)
     receiver = asyncio.create_task(receive_device_messages(websocket, audio_queue))
@@ -274,6 +304,11 @@ async def device_audio(websocket: WebSocket) -> None:
         )
         for task in done:
             task.result()
+        logger.warning(
+            "Device relay completed: receiver_done=%s, cloud_relay_done=%s",
+            receiver in done,
+            relay in done,
+        )
     except WebSocketDisconnect:
         return
     except Exception as exc:
@@ -290,3 +325,4 @@ async def device_audio(websocket: WebSocket) -> None:
             with suppress(asyncio.CancelledError, Exception):
                 await task
         device_locks.pop(websocket, None)
+        logger.info("ESP32 disconnected: %s", websocket.client)

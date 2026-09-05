@@ -1,4 +1,3 @@
-#include "esp_check.h"
 #include <stdlib.h>
 
 #include "esp_log.h"
@@ -13,6 +12,8 @@
 #include "pet_wifi.h"
 
 static const char *TAG = "pet_main";
+static StaticStreamBuffer_t s_audio_stream_state;
+static uint8_t s_audio_stream_storage[PET_AUDIO_BYTES * 12 + 1];
 
 void app_main(void)
 {
@@ -25,17 +26,24 @@ void app_main(void)
 
     ESP_ERROR_CHECK(pet_leds_start());
 
-    StreamBufferHandle_t audio_stream = xStreamBufferCreate(PET_AUDIO_BYTES * 25, PET_AUDIO_BYTES);
+    // Initialize I2C before I2S. This keeps peripheral setup deterministic and
+    // avoids the I2C/GDMA startup conflict seen on some ESP32-S3 boards.
+    err = pet_touch_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MPR121 unavailable; voice mode will continue: %s", esp_err_to_name(err));
+    }
+
+    StreamBufferHandle_t audio_stream = xStreamBufferCreateStatic(
+        PET_AUDIO_BYTES * 12,
+        PET_AUDIO_BYTES,
+        s_audio_stream_storage,
+        &s_audio_stream_state
+    );
     if (!audio_stream) {
-        ESP_LOGE(TAG, "Unable to allocate audio stream buffer");
+        ESP_LOGE(TAG, "Unable to create static audio queue");
         abort();
     }
     ESP_ERROR_CHECK(pet_audio_start(audio_stream));
-
-    err = pet_touch_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "MPR121 touch initialization failed: %s", esp_err_to_name(err));
-    }
 
     ESP_ERROR_CHECK(pet_wifi_connect());
     ESP_ERROR_CHECK(pet_cloud_start(audio_stream));

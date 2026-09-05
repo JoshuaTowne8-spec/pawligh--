@@ -1,6 +1,8 @@
-# PetEmotionLamp Arduino IDE 版本
+# PetEmotionLamp Arduino IDE 旧版本
 
-本工程用于 ESP32-S3 N16R8，控制两条独立 WS2812B 灯带（30 颗和 60 颗）、INMP441 麦克风及 MPR121 九点触摸板，并通过现有电脑网关接入阿里云百炼。
+> 为了减少配置分叉和编译问题，当前项目只推荐使用仓库根目录 `firmware` 中的 ESP-IDF 版本。本目录仅作参考，不再作为主程序。
+
+本工程用于 ESP32-S3 N16R8，控制两条独立 WS2812B 灯带（30 颗和 60 颗）、INMP441 麦克风及 MPR121 八点触摸板，并通过现有电脑网关接入阿里云百炼。
 
 ## Arduino IDE 环境
 
