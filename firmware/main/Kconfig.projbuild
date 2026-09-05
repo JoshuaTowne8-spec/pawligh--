@@ -18,7 +18,7 @@ config PET_DEVICE_TOKEN
 
 config PET_LED_CHAINED
     bool "Two LED rows are daisy-chained as in the product photo"
-    default y
+    default n
     help
         Enable when row A DOUT is already connected to row B DIN and there is
         only one three-wire input plug. Both rows then use GPIO4 as one strip.
@@ -26,12 +26,12 @@ config PET_LED_CHAINED
 config PET_LED_COUNT_A
     int "LED count in row A"
     range 1 300
-    default 10
+    default 30
 
 config PET_LED_COUNT_B
     int "LED count in row B"
     range 1 300
-    default 10
+    default 60
 
 config PET_LED_BRIGHTNESS
     int "Maximum LED brightness (0-255)"

@@ -1,4 +1,5 @@
 gateway/.env
+gateway/data/
 .venv/
 arduino/PetEmotionLamp/config.h
 __pycache__/

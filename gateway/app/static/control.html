@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Pet Emotion Lamp · 灯效控制台</title>
+  <style>
+    :root { --ink:#5b4938; --line:#9b7953; --cream:#fff8e9; --active:#ffc98e; }
+    * { box-sizing:border-box } body { margin:0; background:#fbf3e3; color:var(--ink); font-family:system-ui,"Microsoft YaHei",sans-serif }
+    header { padding:24px 32px 12px; display:flex; justify-content:space-between; align-items:center }
+    h1 { margin:0; font-size:26px } #status { font-size:13px; opacity:.75 }
+    main { display:grid; grid-template-columns:260px minmax(420px,1fr) 310px; gap:20px; padding:18px 32px 36px; max-width:1400px; margin:auto }
+    section,.panel { background:rgba(255,252,243,.86); border:2px solid #dfc9a8; border-radius:22px; padding:18px; box-shadow:0 8px 20px #9b79531c }
+    .preset { width:100%; border:2px solid var(--line); border-radius:18px; background:var(--cream); color:var(--ink); font-size:18px; padding:14px 12px; margin:6px 0; cursor:pointer; text-align:left }
+    .preset.active { background:var(--active); font-weight:700 }
+    #preview { height:260px; border-radius:18px; background:#241e1a; display:flex; flex-direction:column; justify-content:center; gap:30px; padding:32px 20px }
+    .row { display:flex; gap:5px; align-items:center; justify-content:center }
+    .led { width:12px; height:12px; border-radius:50%; background:#332b25; box-shadow:0 0 4px #000 inset; transition:background .1s,box-shadow .1s }
+    label { display:block; margin:13px 0 5px; font-size:14px } input,select,button { font:inherit } input[type=text],select,input[type=number] { width:100%; padding:9px; border:1px solid #c5aa86; border-radius:9px; background:#fffdf7; color:var(--ink) }
+    input[type=color] { width:54px; height:34px; vertical-align:middle; border:0; padding:0; background:none } input[type=range] { width:100% }
+    .colors { display:flex; gap:16px; align-items:center } .colors label { margin:0; flex:1 }
+    .actions { display:flex; gap:8px; margin-top:18px; flex-wrap:wrap } button.action { border:0; border-radius:10px; padding:10px 14px; cursor:pointer; background:#b77945; color:white } button.secondary { background:#ddc09b; color:var(--ink) }
+    .hint { font-size:12px; opacity:.7; line-height:1.5 } @media(max-width:1000px){main{grid-template-columns:1fr 1fr} main .center{grid-column:1/-1}} @media(max-width:650px){header{padding:18px}main{display:block;padding:10px 18px}.panel,section{margin-bottom:14px}}
+  </style>
+</head>
+<body>
+<header><h1>宠物情绪灯效控制台</h1><div id="status">正在读取设备状态…</div></header>
+<main>
+  <section><h2>七个预设</h2><div id="presets"></div><p class="hint">点击预设可立即发送到 ESP32。触摸效果仍由 MPR121 在设备端优先触发。</p></section>
+  <section class="center"><h2 id="title">灯效预览</h2><div id="preview"><div class="row" id="rowA"></div><div class="row" id="rowB"></div></div><div class="actions"><button class="action" onclick="sendNow()">立即发送</button><button class="action secondary" onclick="saveCurrent()">保存参数</button><button class="action secondary" onclick="resetCurrent()">恢复本项默认</button></div></section>
+  <section><h2>参数编辑</h2>
+    <label>动画类型<select id="type"><option>solid</option><option>breath</option><option>wave</option><option>center_breath</option><option>chase</option><option>sparkle</option><option>heartbeat</option></select></label>
+    <div class="colors"><label>颜色 1 <input id="color1" type="color"></label><label>颜色 2 <input id="color2" type="color"></label></div>
+    <label>亮度 <output id="brightnessOut"></output><input id="brightness" type="range" min="1" max="128"></label>
+    <label>速度 <output id="speedOut"></output><input id="speed" type="range" min="1" max="100"></label>
+    <label>周期（毫秒）<input id="period_ms" type="number" min="200" max="20000" step="100"></label>
+    <label>方向<select id="direction"><option>forward</option><option>backward</option><option>inward</option><option>center_out</option></select></label>
+    <label>闪烁密度 <output id="sparkleOut"></output><input id="sparkle" type="range" min="0" max="100"></label>
+    <label><input id="mirror" type="checkbox"> 两条灯带镜像播放</label>
+    <p class="hint">参数会保存在网关的 gateway/data/effects.json。刷新页面不会丢失。</p>
+  </section>
+</main>
+<script>
+let state, current;
+const $ = id => document.getElementById(id);
+const fields = ['type','color1','color2','brightness','speed','period_ms','direction','sparkle','mirror'];
+function hex(v){ return /^#[0-9a-f]{6}$/i.test(v) ? v : '#ffffff'; }
+function renderButtons(){ $('presets').innerHTML = state.order.map(id => `<button class="preset ${id===state.active?'active':''}" onclick="choose('${id}')">${state.labels[id]}</button>`).join(''); }
+function renderPreview(){
+  for(const id of ['rowA','rowB']) $(id).innerHTML='';
+  for(let i=0;i<30;i++) $('rowA').appendChild(document.createElement('i')).className='led';
+  for(let i=0;i<60;i++) $('rowB').appendChild(document.createElement('i')).className='led';
+  const a=[...document.querySelectorAll('#rowA .led')], b=[...document.querySelectorAll('#rowB .led')]; let t=0;
+  setInterval(()=>{ t+=0.04*(Number(current?.speed||20)/20); const c1=current?.color1||'#222'; const c2=current?.color2||'#222'; const type=current?.type||'breath'; const paint=(el,i,n)=>{let p=i/(n-1), v=(Math.sin(t*(type==='chase'?3:1)+p*6.28)+1)/2; if(type==='solid')v=1; if(type==='center_breath')v=(1-Math.abs(p-.5)*2)*(.5+.5*Math.sin(t)); if(type==='chase')v=Math.max(0,1-Math.abs(((p+t*.25)%1)-.5)*2); el.style.background=`color-mix(in srgb, ${c1} ${Math.round(v*100)}%, ${c2})`; el.style.boxShadow=`0 0 ${Math.round(v*14)}px ${c1}`}; a.forEach((e,i)=>paint(e,i,30)); b.forEach((e,i)=>paint(e,current?.mirror?59-i:i,60)); },50);
+}
+function loadForm(){ for(const id of fields){ const el=$(id); if(el.type==='checkbox')el.checked=!!current[id]; else el.value=current[id]; } updateOutputs(); }
+function readForm(){ for(const id of fields){ const el=$(id); current[id]=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value; } }
+function updateOutputs(){ ['brightness','speed','sparkle'].forEach(id=>$(id+'Out').value=$(id).value); }
+fields.forEach(id=>$(id).addEventListener('input',()=>{readForm();updateOutputs()}));
+async function choose(id){ state.active=id; current={...state.effects[id]}; $('title').textContent='编辑：'+state.labels[id]; loadForm(); renderButtons(); await fetch('/api/effects/'+id+'/activate',{method:'POST'}); }
+async function saveCurrent(){ readForm(); const r=await fetch('/api/effects/'+state.active,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(current)}); if(!r.ok){alert(await r.text());return} state.effects[state.active]=await r.json(); current={...state.effects[state.active]}; alert('已保存并发送'); }
+async function sendNow(){ readForm(); await fetch('/api/effects/'+state.active+'/activate',{method:'POST'}); }
+function resetCurrent(){ current={...state.effects[state.active]}; loadForm(); }
+async function init(){ state=await (await fetch('/api/effects')).json(); current={...state.effects[state.active]}; renderButtons();loadForm();renderPreview(); setInterval(async()=>{const s=await (await fetch('/api/status')).json();$('status').textContent=`在线设备：${s.devices} · 当前：${state.labels[s.active]||s.active}`},3000); }
+init();
+</script>
+</body>
+</html>

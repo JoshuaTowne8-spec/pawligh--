@@ -4,22 +4,69 @@ import json
 import os
 import uuid
 from contextlib import suppress
+from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse
+
+from .effects import (
+    EMOTION_LABELS,
+    PRESET_ORDER,
+    load_effects,
+    save_effects,
+    validate_effect,
+)
 
 
-app = FastAPI(title="Pet Emotion Gateway", version="0.1.0")
+app = FastAPI(title="Pet Emotion Gateway", version="0.2.0")
+APP_DIR = Path(__file__).resolve().parent
+EFFECTS_PATH = APP_DIR.parent / "data" / "effects.json"
+effects = load_effects(EFFECTS_PATH)
+connected_devices: set[WebSocket] = set()
+device_locks: dict[WebSocket, asyncio.Lock] = {}
+active_preset = "calm"
 
-EMOTION_TO_EFFECT = {
-    "neutral": "calm_breath",
-    "happy": "warm_sparkle",
-    "sad": "comfort_breath",
-    "surprised": "attention_bloom",
-    "angry": "soothing_amber",
-    "fearful": "protective_glow",
-    "disgusted": "settle_to_warm",
-}
+def normalize_emotion(raw: str, transcript: str) -> str:
+    """Map ASR's seven acoustic labels plus speech content to five product labels."""
+    text = transcript or ""
+    if any(word in text for word in ("想你", "想念", "怀念", "回忆", "以前", "离开", "再见", "陪伴")):
+        return "miss"
+    if any(word in text for word in ("爱你", "谢谢", "乖", "温柔", "拥抱", "好暖", "陪着")):
+        return "warm"
+    return {
+        "happy": "happy",
+        "surprised": "happy",
+        "neutral": "calm",
+        "sad": "sad",
+        "angry": "sad",
+        "fearful": "sad",
+        "disgusted": "sad",
+    }.get(raw, "calm")
+
+
+async def send_to_device(device: WebSocket, payload: dict) -> None:
+    lock = device_locks.setdefault(device, asyncio.Lock())
+    async with lock:
+        await device.send_json(payload)
+
+
+async def broadcast(payload: dict) -> None:
+    stale = []
+    for device in tuple(connected_devices):
+        try:
+            await send_to_device(device, payload)
+        except Exception:
+            stale.append(device)
+    for device in stale:
+        connected_devices.discard(device)
+        device_locks.pop(device, None)
+
+
+async def select_preset(preset: str) -> None:
+    global active_preset
+    active_preset = preset
+    await broadcast({"type": "effect.select", "preset": preset, "config": effects[preset]})
 
 
 def required_env(name: str) -> str:
@@ -100,6 +147,50 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/control")
+async def control_page():
+    return FileResponse(APP_DIR / "static" / "control.html")
+
+
+@app.get("/api/effects")
+async def get_effects() -> dict:
+    return {"order": PRESET_ORDER, "labels": EMOTION_LABELS, "effects": effects, "active": active_preset}
+
+
+@app.get("/api/status")
+async def get_status() -> dict:
+    return {"devices": len(connected_devices), "active": active_preset}
+
+
+@app.put("/api/effects/{preset}")
+async def update_effect(preset: str, payload: dict) -> dict:
+    try:
+        effects[preset] = validate_effect(payload, preset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    save_effects(EFFECTS_PATH, effects)
+    if active_preset == preset:
+        await select_preset(preset)
+    return effects[preset]
+
+
+@app.post("/api/effects/{preset}/activate")
+async def activate_effect(preset: str) -> dict[str, str]:
+    if preset not in PRESET_ORDER:
+        raise HTTPException(status_code=404, detail="unknown preset")
+    await select_preset(preset)
+    return {"active": preset}
+
+
+@app.post("/api/effects/reset")
+async def reset_effects() -> dict:
+    global effects
+    effects = load_effects(Path("__missing_defaults_only__"))
+    save_effects(EFFECTS_PATH, effects)
+    await select_preset(active_preset)
+    return {"effects": effects}
+
+
 async def send_audio_to_cloud(device: WebSocket, cloud: websockets.WebSocketClientProtocol) -> None:
     while True:
         message = await device.receive()
@@ -136,16 +227,23 @@ async def send_results_to_device(device: WebSocket, cloud: websockets.WebSocketC
             return
 
         if message_type == "conversation.item.input_audio_transcription.completed":
-            emotion = message.get("emotion") or "neutral"
-            await device.send_json(
+            raw_emotion = message.get("emotion") or "neutral"
+            transcript = message.get("transcript", "")
+            emotion = normalize_emotion(raw_emotion, transcript)
+            await send_to_device(
+                device,
                 {
-                    "type": "emotion",
+                    "type": "effect.select",
                     "emotion": emotion,
-                    "light_effect": EMOTION_TO_EFFECT.get(emotion, "calm_breath"),
-                    "transcript": message.get("transcript", ""),
+                    "preset": emotion,
+                    "config": effects[emotion],
+                    "raw_emotion": raw_emotion,
+                    "transcript": transcript,
                     "hold_ms": 12000,
                 }
             )
+            global active_preset
+            active_preset = emotion
         elif message_type == "session.finished":
             return
 
@@ -158,6 +256,8 @@ async def device_audio(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    connected_devices.add(websocket)
+    device_locks.setdefault(websocket, asyncio.Lock())
     api_key = required_env("DASHSCOPE_API_KEY")
 
     try:
@@ -170,7 +270,9 @@ async def device_audio(websocket: WebSocket) -> None:
             max_size=4 * 1024 * 1024,
         ) as cloud:
             await configure_cloud(cloud)
-            await websocket.send_json({"type": "ready", "sample_rate": 16000})
+            await send_to_device(websocket, {"type": "ready", "sample_rate": 16000})
+            await send_to_device(websocket, {"type": "effects.sync", "presets": effects})
+            await send_to_device(websocket, {"type": "effect.select", "preset": active_preset, "config": effects[active_preset]})
 
             uplink = asyncio.create_task(send_audio_to_cloud(websocket, cloud))
             downlink = asyncio.create_task(send_results_to_device(websocket, cloud))
@@ -188,8 +290,12 @@ async def device_audio(websocket: WebSocket) -> None:
         return
     except Exception as exc:
         with suppress(Exception):
-            await websocket.send_json(
+            await send_to_device(
+                websocket,
                 {"type": "gateway_error", "message": type(exc).__name__}
             )
         with suppress(Exception):
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+    finally:
+        connected_devices.discard(websocket)
+        device_locks.pop(websocket, None)

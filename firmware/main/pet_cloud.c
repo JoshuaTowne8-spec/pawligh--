@@ -33,6 +33,12 @@ static void process_json(const char *text, size_t length)
         if (strcmp(type->valuestring, "ready") == 0) {
             ESP_LOGI(TAG, "Gateway ready; microphone upload enabled");
             pet_audio_set_streaming(true);
+        } else if (strcmp(type->valuestring, "effect.select") == 0) {
+            const cJSON *preset = cJSON_GetObjectItemCaseSensitive(root, "preset");
+            const cJSON *config = cJSON_GetObjectItemCaseSensitive(root, "config");
+            if (cJSON_IsString(preset)) {
+                pet_leds_apply_config(preset->valuestring, config);
+            }
         } else if (strcmp(type->valuestring, "emotion") == 0) {
             const cJSON *emotion = cJSON_GetObjectItemCaseSensitive(root, "emotion");
             if (cJSON_IsString(emotion)) {
