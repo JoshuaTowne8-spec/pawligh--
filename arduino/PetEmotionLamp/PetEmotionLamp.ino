@@ -262,14 +262,14 @@ static void startTouch() {
     Serial.println("[touch] MPR121 not found at address 0x5A; touch disabled");
     return;
   }
-  Serial.println("[touch] MPR121 ready: electrodes E0-E8");
+  Serial.println("[touch] MPR121 ready: E0=head, E1-E7=back");
 }
 
 static void updateTouch() {
   if (!touchAvailable || millis() - lastTouchPollAt < 20) return;
   lastTouchPollAt = millis();
 
-  uint16_t mask = touchController.touched() & 0x01FF;
+  uint16_t mask = touchController.touched() & 0x00FF;
   uint32_t now = millis();
 
   if (previousTouchMask == 0 && mask != 0) {

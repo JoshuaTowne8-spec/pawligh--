@@ -34,7 +34,7 @@ static esp_err_t read_touch_mask(uint16_t *mask)
     uint8_t data[2];
     esp_err_t err = i2c_master_transmit_receive(s_mpr121, &reg, 1, data, sizeof(data), 100);
     if (err == ESP_OK) {
-        *mask = ((uint16_t)data[1] << 8 | data[0]) & 0x01FF;
+        *mask = ((uint16_t)data[1] << 8 | data[0]) & 0x00FF;
     }
     return err;
 }
@@ -54,13 +54,13 @@ static esp_err_t configure_mpr121(void)
     for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); ++i) {
         ESP_RETURN_ON_ERROR(write_reg(filters[i].reg, filters[i].value), TAG, "filter setup failed");
     }
-    for (int electrode = 0; electrode < 9; ++electrode) {
+    for (int electrode = 0; electrode < 8; ++electrode) {
         ESP_RETURN_ON_ERROR(write_reg(0x41 + electrode * 2, 12), TAG, "touch threshold failed");
         ESP_RETURN_ON_ERROR(write_reg(0x42 + electrode * 2, 6), TAG, "release threshold failed");
     }
 
-    // CL=2 (baseline tracking) and ELEPROX=0, ELE=9 active electrodes.
-    ESP_RETURN_ON_ERROR(write_reg(MPR121_ECR, 0x89), TAG, "run mode failed");
+    // CL=2 (baseline tracking) and ELEPROX=0, ELE=8 active electrodes.
+    ESP_RETURN_ON_ERROR(write_reg(MPR121_ECR, 0x88), TAG, "run mode failed");
     return ESP_OK;
 }
 
@@ -146,6 +146,6 @@ esp_err_t pet_touch_start(void)
     if (xTaskCreate(touch_task, "pet_touch", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "MPR121 started with electrodes E0-E8");
+    ESP_LOGI(TAG, "MPR121 started: E0=head, E1-E7=back");
     return ESP_OK;
 }
