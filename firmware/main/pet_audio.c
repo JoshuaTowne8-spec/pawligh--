@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
+#include "pet_leds.h"
 #include "pet_pins.h"
 
 static const char *TAG = "pet_audio";
@@ -22,6 +23,40 @@ static int32_t s_raw_samples[PET_AUDIO_SAMPLES];
 static int16_t s_pcm_samples[PET_AUDIO_SAMPLES];
 static uint32_t s_dropped_frames;
 static int64_t s_last_drop_log_us;
+static uint8_t s_voice_frames;
+
+static void detect_voice_activity(const int16_t *samples, size_t count)
+{
+    if (!samples || count == 0) {
+        return;
+    }
+
+    int64_t sum = 0;
+    for (size_t i = 0; i < count; ++i) {
+        sum += samples[i];
+    }
+    int32_t dc = sum / (int64_t)count;
+
+    uint64_t energy = 0;
+    for (size_t i = 0; i < count; ++i) {
+        int32_t centered = (int32_t)samples[i] - dc;
+        energy += (int64_t)centered * centered;
+    }
+
+    uint64_t mean_square = energy / count;
+    uint32_t threshold = CONFIG_PET_VOICE_RMS_THRESHOLD;
+    bool voice_now = mean_square >= (uint64_t)threshold * threshold;
+    if (voice_now) {
+        if (s_voice_frames < 3) {
+            ++s_voice_frames;
+        }
+        if (s_voice_frames >= 3) {
+            pet_leds_note_voice_activity();
+        }
+    } else {
+        s_voice_frames = 0;
+    }
+}
 
 static void note_dropped_frame(void)
 {
@@ -67,6 +102,7 @@ static void audio_task(void *arg)
         for (size_t i = 0; i < samples; ++i) {
             s_pcm_samples[i] = convert_sample(s_raw_samples[i]);
         }
+        detect_voice_activity(s_pcm_samples, samples);
 
         if (s_streaming) {
             size_t bytes = samples * sizeof(s_pcm_samples[0]);

@@ -46,4 +46,14 @@ config PET_MIC_GAIN
     range 1 16
     default 4
 
+config PET_VOICE_RMS_THRESHOLD
+    int "Local voice detection RMS threshold"
+    range 50 5000
+    default 300
+    help
+        Three consecutive 40 ms audio frames above this RMS value count as
+        speech and restart the calm-light silence timer. Increase this value
+        if touching the enclosure is mistaken for speech; decrease it if soft
+        speech is not detected.
+
 endmenu
