@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "led_strip_rmt.h"
@@ -114,7 +115,13 @@ static void render_pixel(effect_config_t *fx,bool overlay,bool fast,int row,int 
 static void led_task(void *arg)
 {
     uint8_t phase=0; while(true){effect_config_t fx;bool fast;int64_t until;portENTER_CRITICAL(&s_lock);fx=s_effect;fast=s_overlay_fast;until=s_overlay_until_us;portEXIT_CRITICAL(&s_lock);bool overlay=esp_timer_get_time()<until;
-        for(int i=0;i<CONFIG_PET_LED_COUNT_A;++i)render_pixel(&fx,overlay,fast,0,i,CONFIG_PET_LED_COUNT_A,phase);for(int i=0;i<CONFIG_PET_LED_COUNT_B;++i)render_pixel(&fx,overlay,fast,1,i,CONFIG_PET_LED_COUNT_B,phase);led_strip_refresh(s_strip_a);
+        for (int i = 0; i < CONFIG_PET_LED_COUNT_A; ++i) {
+            render_pixel(&fx, overlay, fast, 0, i, CONFIG_PET_LED_COUNT_A, phase);
+        }
+        for (int i = 0; i < CONFIG_PET_LED_COUNT_B; ++i) {
+            render_pixel(&fx, overlay, fast, 1, i, CONFIG_PET_LED_COUNT_B, phase);
+        }
+        led_strip_refresh(s_strip_a);
 #if !CONFIG_PET_LED_CHAINED
         led_strip_refresh(s_strip_b);
 #endif
@@ -124,7 +131,10 @@ static void led_task(void *arg)
 static esp_err_t create_strip(gpio_num_t gpio,int count,led_strip_handle_t *result)
 {
     led_strip_config_t config={.strip_gpio_num=gpio,.max_leds=count,.led_model=LED_MODEL_WS2812,.color_component_format=LED_STRIP_COLOR_COMPONENT_FMT_GRB,.flags.invert_out=false};
-    led_strip_rmt_config_t rmt={.clk_src=RMT_CLK_SRC_DEFAULT,.resolution_hz=10*1000*1000,.mem_block_symbols=64,.flags.with_dma=true};
+    // Two independent strips need two RMT TX channels.  DMA mode exhausts the
+    // available TX resources on this ESP32-S3 configuration, so use normal RMT.
+    // It is fully sufficient for the 30- and 60-pixel WS2812 strips.
+    led_strip_rmt_config_t rmt={.clk_src=RMT_CLK_SRC_DEFAULT,.resolution_hz=10*1000*1000,.mem_block_symbols=64,.flags.with_dma=false};
     return led_strip_new_rmt_device(&config,&rmt,result);
 }
 
