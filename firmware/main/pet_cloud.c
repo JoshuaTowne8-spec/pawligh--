@@ -17,8 +17,45 @@ static esp_websocket_client_handle_t s_client;
 static StreamBufferHandle_t s_audio_stream;
 static volatile bool s_connected;
 static volatile bool s_flush_audio;
+static volatile bool s_gateway_ready;
+static volatile bool s_always_on;
 static char s_text_message[1024];
 static uint8_t s_audio_batch[PET_AUDIO_BATCH_BYTES];
+
+void pet_cloud_notify_touch(bool fast)
+{
+    if (!s_connected || !s_client || !esp_websocket_client_is_connected(s_client)) {
+        return;
+    }
+    const char *message = fast
+        ? "{\"type\":\"touch\",\"kind\":\"quick\"}"
+        : "{\"type\":\"touch\",\"kind\":\"slow\"}";
+    int sent = esp_websocket_client_send_text(
+        s_client,
+        message,
+        strlen(message),
+        pdMS_TO_TICKS(250)
+    );
+    if (sent < 0) {
+        ESP_LOGW(TAG, "Unable to report touch to gateway");
+    }
+}
+
+static void update_audio_streaming(void)
+{
+    pet_audio_set_streaming(s_connected && s_gateway_ready && !s_always_on);
+}
+
+static void send_status(void)
+{
+    if (!s_connected || !esp_websocket_client_is_connected(s_client)) {
+        return;
+    }
+    const char *status = s_always_on
+        ? "{\"type\":\"status\",\"always_on\":true}"
+        : "{\"type\":\"status\",\"always_on\":false}";
+    esp_websocket_client_send_text(s_client, status, strlen(status), pdMS_TO_TICKS(1000));
+}
 
 static void process_json(const char *text, size_t length)
 {
@@ -31,15 +68,38 @@ static void process_json(const char *text, size_t length)
     const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
     if (cJSON_IsString(type)) {
         if (strcmp(type->valuestring, "ready") == 0) {
-            ESP_LOGI(TAG, "Gateway ready; microphone upload enabled");
-            pet_audio_set_streaming(true);
+            s_gateway_ready = true;
+            update_audio_streaming();
         } else if (strcmp(type->valuestring, "audio.pause") == 0) {
-            ESP_LOGW(TAG, "Gateway cloud session paused; microphone upload disabled");
-            pet_audio_set_streaming(false);
+            s_gateway_ready = false;
+            update_audio_streaming();
+        } else if (strcmp(type->valuestring, "mode") == 0) {
+            const cJSON *always_on = cJSON_GetObjectItemCaseSensitive(root, "always_on");
+            s_always_on = cJSON_IsTrue(always_on);
+            if (s_always_on) {
+                s_gateway_ready = false;
+            }
+            s_flush_audio = true;
+            pet_leds_set_always_on(s_always_on);
+            update_audio_streaming();
+            send_status();
         } else if (strcmp(type->valuestring, "emotion") == 0) {
             const cJSON *emotion = cJSON_GetObjectItemCaseSensitive(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                pet_leds_set_emotion(emotion->valuestring);
+                if (pet_leds_set_emotion(emotion->valuestring)) {
+                    ESP_LOGI(TAG, "VOICE emotion=%s", emotion->valuestring);
+                }
+            }
+        } else if (strcmp(type->valuestring, "effect") == 0) {
+            const cJSON *emotion = cJSON_GetObjectItemCaseSensitive(root, "emotion");
+            const cJSON *hold_ms = cJSON_GetObjectItemCaseSensitive(root, "hold_ms");
+            if (cJSON_IsString(emotion)) {
+                uint32_t duration = cJSON_IsNumber(hold_ms) ? (uint32_t)hold_ms->valuedouble : 12000;
+                pet_leds_show_event(emotion->valuestring, duration);
+                const cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "source");
+                if (cJSON_IsString(source) && strcmp(source->valuestring, "memory") == 0 && !s_always_on) {
+                    ESP_LOGI(TAG, "VOICE emotion=%s", emotion->valuestring);
+                }
             }
         } else if (strstr(type->valuestring, "error") != NULL) {
             const cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "message");
@@ -56,12 +116,14 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t event_id, 
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
+        s_gateway_ready = false;
         ESP_LOGI(TAG, "Connected to emotion gateway");
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_connected = false;
+        s_gateway_ready = false;
         s_flush_audio = true;
-        pet_audio_set_streaming(false);
+        update_audio_streaming();
         ESP_LOGW(TAG, "Gateway disconnected; client will reconnect");
         break;
     case WEBSOCKET_EVENT_DATA:

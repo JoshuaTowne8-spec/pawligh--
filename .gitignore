@@ -5,10 +5,12 @@ arduino/PetEmotionLamp/config.h
 __pycache__/
 *.py[cod]
 .pytest_cache/
-firmware/build/
+firmware/build*/
 firmware/managed_components/
 firmware/dependencies.lock
 firmware/sdkconfig
 firmware/sdkconfig.old
 inmp441_test/build/
 inmp441_test/sdkconfig
+.local-logs/
+.pnpm-store/

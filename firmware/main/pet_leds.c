@@ -45,6 +45,7 @@ static const char *TAG = "pet_leds";
 
 #define CALM_SILENCE_MS 10000
 #define LIGHT_FADE_MS     1000
+#define INACTIVITY_TIMEOUT_MS 60000
 
 // Fixed presets avoid runtime configuration and gateway/device mismatches.
 static const emotion_preset_t PRESETS[] = {
@@ -66,7 +67,28 @@ static touch_effect_t s_touch_effect = TOUCH_NONE;
 static int64_t s_touch_started_ms;
 static int64_t s_touch_until_ms;
 static int64_t s_calm_deadline_ms;
+static int64_t s_inactivity_deadline_ms;
+static int64_t s_event_until_ms;
+static emotion_t s_event_emotion = EMOTION_CALM;
+static bool s_always_on;
 static bool s_awake;
+
+static emotion_t parse_emotion(const char *emotion)
+{
+    if (emotion && strcmp(emotion, "warm") == 0) {
+        return EMOTION_WARM;
+    }
+    if (emotion && strcmp(emotion, "happy") == 0) {
+        return EMOTION_HAPPY;
+    }
+    if (emotion && strcmp(emotion, "miss") == 0) {
+        return EMOTION_MISS;
+    }
+    if (emotion && strcmp(emotion, "sad") == 0) {
+        return EMOTION_SAD;
+    }
+    return EMOTION_CALM;
+}
 
 static uint8_t triangle8(uint16_t phase)
 {
@@ -220,9 +242,31 @@ static void led_task(void *arg)
             s_touch_effect = TOUCH_NONE;
         }
 
-        if (!s_awake) {
+        if (s_event_until_ms > 0 && now_ms >= s_event_until_ms) {
+            s_event_until_ms = 0;
+            if (!s_always_on) {
+                s_awake = false;
+            }
+        }
+
+        if (!s_always_on && s_event_until_ms == 0 && s_awake &&
+            s_inactivity_deadline_ms > 0 && now_ms >= s_inactivity_deadline_ms) {
+            s_awake = false;
+            s_touch_effect = TOUCH_NONE;
+        }
+
+        if (s_always_on) {
+            emotion = EMOTION_CALM;
+        } else if (s_event_until_ms > 0) {
+            emotion = s_event_emotion;
+        } else {
+            emotion = s_emotion;
+        }
+
+        if (!s_awake && !s_always_on && s_event_until_ms == 0) {
             visibility = 0;
-        } else if (s_touch_effect == TOUCH_NONE &&
+        } else if (!s_always_on && s_event_until_ms == 0 &&
+                   s_touch_effect == TOUCH_NONE &&
                    s_emotion == EMOTION_CALM &&
                    s_calm_deadline_ms > 0 &&
                    now_ms >= s_calm_deadline_ms) {
@@ -234,7 +278,6 @@ static void led_task(void *arg)
                 visibility = 255 - (uint32_t)fade_elapsed_ms * 255 / LIGHT_FADE_MS;
             }
         }
-        emotion = s_emotion;
         touch = s_touch_effect;
         touch_started_ms = s_touch_started_ms;
         portEXIT_CRITICAL(&s_state_lock);
@@ -297,25 +340,46 @@ esp_err_t pet_leds_start(void)
     return ESP_OK;
 }
 
-void pet_leds_set_emotion(const char *emotion)
+bool pet_leds_set_emotion(const char *emotion)
 {
-    emotion_t next = EMOTION_CALM;
-    if (emotion && strcmp(emotion, "warm") == 0) {
-        next = EMOTION_WARM;
-    } else if (emotion && strcmp(emotion, "happy") == 0) {
-        next = EMOTION_HAPPY;
-    } else if (emotion && strcmp(emotion, "miss") == 0) {
-        next = EMOTION_MISS;
-    } else if (emotion && strcmp(emotion, "sad") == 0) {
-        next = EMOTION_SAD;
-    }
+    emotion_t next = parse_emotion(emotion);
+    bool applied = false;
 
     int64_t now_ms = esp_timer_get_time() / 1000;
     portENTER_CRITICAL(&s_state_lock);
     // Voice results cannot light the product before the owner has touched it.
-    if (s_awake) {
+    if (s_awake && !s_always_on) {
         s_emotion = next;
         s_calm_deadline_ms = next == EMOTION_CALM ? now_ms + CALM_SILENCE_MS : 0;
+        s_inactivity_deadline_ms = now_ms + INACTIVITY_TIMEOUT_MS;
+        applied = true;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    return applied;
+}
+
+void pet_leds_set_always_on(bool enabled)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    s_always_on = enabled;
+    s_event_until_ms = 0;
+    s_touch_effect = TOUCH_NONE;
+    s_awake = enabled;
+    s_emotion = EMOTION_CALM;
+    s_calm_deadline_ms = 0;
+    s_inactivity_deadline_ms = 0;
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+void pet_leds_show_event(const char *emotion, uint32_t hold_ms)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_state_lock);
+    if (!s_always_on) {
+        s_event_emotion = parse_emotion(emotion);
+        s_event_until_ms = now_ms + hold_ms;
+        s_inactivity_deadline_ms = now_ms + INACTIVITY_TIMEOUT_MS;
+        s_awake = true;
     }
     portEXIT_CRITICAL(&s_state_lock);
 }
@@ -332,6 +396,7 @@ void pet_leds_trigger_touch(bool fast)
     s_touch_effect = fast ? TOUCH_QUICK : TOUCH_SLOW;
     s_touch_started_ms = now_ms;
     s_touch_until_ms = until_ms;
+    s_inactivity_deadline_ms = now_ms + INACTIVITY_TIMEOUT_MS;
     if (s_emotion == EMOTION_CALM) {
         // Give calm a full ten seconds after the immediate touch animation.
         s_calm_deadline_ms = until_ms + CALM_SILENCE_MS;
@@ -341,8 +406,12 @@ void pet_leds_trigger_touch(bool fast)
 
 void pet_leds_note_voice_activity(void)
 {
-    int64_t deadline_ms = esp_timer_get_time() / 1000 + CALM_SILENCE_MS;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int64_t deadline_ms = now_ms + CALM_SILENCE_MS;
     portENTER_CRITICAL(&s_state_lock);
+    if (s_awake && !s_always_on) {
+        s_inactivity_deadline_ms = now_ms + INACTIVITY_TIMEOUT_MS;
+    }
     if (s_awake && s_emotion == EMOTION_CALM && deadline_ms > s_calm_deadline_ms) {
         s_calm_deadline_ms = deadline_ms;
     }

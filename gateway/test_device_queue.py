@@ -1,7 +1,13 @@
 import asyncio
 import unittest
 
-from gateway.app.main import normalize_emotion, receive_device_messages
+from gateway.app.main import (
+    archive_snapshot,
+    first_emotion,
+    matching_memory,
+    normalize_emotion,
+    receive_device_messages,
+)
 
 
 class FakeDevice:
@@ -45,6 +51,27 @@ class DeviceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalize_emotion("sad", "谢谢你陪着我"), "warm")
         self.assertEqual(normalize_emotion("angry", ""), "sad")
         self.assertEqual(normalize_emotion("neutral", ""), "calm")
+
+    def test_seaside_memory_matching(self) -> None:
+        previous = dict(archive_snapshot)
+        try:
+            archive_snapshot.clear()
+            archive_snapshot.update({
+                "events": [{
+                    "id": "sea",
+                    "kind": "memory",
+                    "title": "海边散步",
+                    "text": "它追着浪花跑了很久。",
+                    "tags": ["快乐"],
+                }]
+            })
+            memory = matching_memory("我今天又想起我们一起看海了")
+            self.assertIsNotNone(memory)
+            self.assertEqual(memory["id"], "sea")
+            self.assertEqual(first_emotion(memory["tags"]), "happy")
+        finally:
+            archive_snapshot.clear()
+            archive_snapshot.update(previous)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "pet_cloud.h"
 #include "pet_leds.h"
 #include "pet_pins.h"
 
@@ -91,6 +92,8 @@ static void touch_task(void *arg)
 
         if (touching && touched_now && !slow_fired && now - gesture_start_us >= 800000) {
             pet_leds_trigger_touch(false);
+            pet_cloud_notify_touch(false);
+            ESP_LOGI(TAG, "TOUCH slow");
             slow_fired = true;
         }
 
@@ -98,6 +101,8 @@ static void touch_task(void *arg)
             int64_t duration = now - gesture_start_us;
             if (!slow_fired && duration >= 50000) {
                 pet_leds_trigger_touch(true);
+                pet_cloud_notify_touch(true);
+                ESP_LOGI(TAG, "TOUCH quick");
             }
             touching = false;
             gesture_start_us = 0;

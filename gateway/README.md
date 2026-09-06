@@ -57,3 +57,14 @@ must be entered locally; never send them in chat or commit `.env`.
 
 In production, put Caddy, Nginx, or an Alibaba Cloud load balancer with a valid
 TLS certificate in front of port 8080. Only expose port 443 publicly.
+
+## PawLight web control
+
+The local PawLight web app proxies device requests to this gateway. The control
+API only accepts loopback clients unless `CONTROL_TOKEN` is configured. The web
+app synchronizes the pet archive so the gateway can persist calm always-on
+mode, pause cloud audio while that mode is active, play anniversary emotions,
+and create a companion-page event when seaside memories are mentioned.
+
+Runtime state is stored in the ignored `gateway/data` directory. API keys and
+device tokens remain only in the ignored `gateway/.env` file.
